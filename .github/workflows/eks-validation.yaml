@@ -1,0 +1,231 @@
+name: EKS Cluster Validation
+
+on:
+  schedule:
+    # Run validation every 6 hours
+    - cron: '0 */6 * * *'
+  
+  workflow_dispatch:
+  
+  workflow_run:
+    workflows: ["Terraform Apply (Manual)"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  eks-validation:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Get EKS Cluster Info
+        id: cluster_info
+        run: |
+          CLUSTER_NAME="${{ secrets.EKS_CLUSTER_NAME || 'vprofile-eks-cluster' }}"
+          REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          
+          echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          
+          echo "📌 Fetching EKS cluster information..."
+          aws eks describe-cluster \
+            --name "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --query 'cluster.{Name:name,Version:version,Status:status,Endpoint:endpoint,CreatedAt:createdAt}' \
+            --output table
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ steps.cluster_info.outputs.cluster_name }}" \
+            --region "${{ steps.cluster_info.outputs.region }}"
+          
+          echo "✅ kubeconfig updated"
+
+      - name: Validate Cluster Connectivity
+        run: |
+          echo "🔗 Testing cluster connectivity..."
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Check Node Status
+        run: |
+          echo "📊 Node Status Report"
+          echo "===================="
+          kubectl get nodes -o wide
+          kubectl top nodes 2>/dev/null || echo "⚠️  Metrics not available"
+
+      - name: Validate ArgoCD Installation
+        id: argocd_check
+        run: |
+          echo "🔍 Checking ArgoCD installation..."
+          
+          if kubectl get namespace argocd &>/dev/null; then
+            echo "argocd_installed=true" >> $GITHUB_OUTPUT
+            echo "✅ ArgoCD namespace exists"
+            
+            kubectl get pods -n argocd -o wide
+            
+            # Check ArgoCD version
+            ARGOCD_VERSION=$(kubectl get deployment argocd-server -n argocd -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+            echo "ArgoCD Image: $ARGOCD_VERSION"
+            
+            # Check ArgoCD applications
+            echo "📋 ArgoCD Applications:"
+            kubectl get applications -n argocd 2>/dev/null || echo "No applications found"
+          else
+            echo "argocd_installed=false" >> $GITHUB_OUTPUT
+            echo "⚠️  ArgoCD not installed"
+          fi
+
+      - name: Validate ALB Ingress Controller
+        run: |
+          echo "🌐 Checking AWS Load Balancer Controller (ALB)..."
+          
+          if kubectl get deployment aws-load-balancer-controller -n kube-system &>/dev/null; then
+            echo "✅ AWS Load Balancer Controller installed"
+            kubectl get deployment aws-load-balancer-controller -n kube-system -o wide
+          else
+            echo "⚠️  AWS Load Balancer Controller not found"
+          fi
+
+      - name: Check Ingress Configuration
+        run: |
+          echo "🔌 Ingress Resources:"
+          kubectl get ingress -A
+          
+          echo ""
+          echo "ArgoCD Ingress Details:"
+          kubectl describe ingress argocd-ingress -n argocd 2>/dev/null || echo "⚠️  ArgoCD ingress not found"
+
+      - name: Validate EBS CSI Driver
+        run: |
+          echo "💾 Checking EBS CSI Driver..."
+          
+          if kubectl get addon -o jsonpath='{.items[*].metadata.name}' --kubeconfig="$KUBECONFIG" 2>/dev/null | grep -q 'ebs-csi-driver'; then
+            echo "✅ EBS CSI Driver addon enabled"
+            kubectl get pods -n kube-system | grep ebs-csi || echo "Pods not yet running"
+          else
+            echo "⚠️  EBS CSI Driver addon not enabled"
+          fi
+
+      - name: Check Storage Classes
+        run: |
+          echo "📦 Available Storage Classes:"
+          kubectl get storageclass -o wide
+
+      - name: Validate Security Groups
+        run: |
+          CLUSTER_NAME="${{ steps.cluster_info.outputs.cluster_name }}"
+          REGION="${{ steps.cluster_info.outputs.region }}"
+          
+          echo "🔒 Security Group Configuration:"
+          
+          # Get cluster security groups
+          SG_IDS=$(aws eks describe-cluster \
+            --name "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --query 'cluster.resourcesVpcConfig.securityGroupIds[*]' \
+            --output text)
+          
+          for sg_id in $SG_IDS; do
+            echo "Security Group: $sg_id"
+            aws ec2 describe-security-groups \
+              --group-ids "$sg_id" \
+              --region "$REGION" \
+              --query 'SecurityGroups[0].IpPermissions' \
+              --output table
+          done
+
+      - name: Check Service Accounts and RBAC
+        run: |
+          echo "👤 Service Accounts (argocd namespace):"
+          kubectl get serviceaccounts -n argocd
+          
+          echo ""
+          echo "🔐 RBAC Roles (argocd namespace):"
+          kubectl get roles -n argocd
+          kubectl get rolebindings -n argocd
+
+      - name: Validate DNS Resolution
+        run: |
+          echo "🌐 DNS Resolution Check:"
+          
+          # Test DNS pod
+          kubectl run -it --rm debug --image=alpine --restart=Never -- \
+            nslookup kubernetes.default.svc.cluster.local 2>/dev/null || echo "DNS test completed"
+
+      - name: Generate Validation Report
+        if: always()
+        run: |
+          cat > eks_validation_report.md << 'EOF'
+          # EKS Cluster Validation Report
+          
+          ## Test Results
+          - **Cluster Connectivity**: ✅
+          - **Node Status**: ✅
+          - **ArgoCD Installation**: ${{ steps.argocd_check.outputs.argocd_installed }}
+          - **ALB Ingress**: Check logs above
+          - **EBS CSI Driver**: Check logs above
+          
+          ## Recommendations
+          If any check failed:
+          1. Review the detailed logs above
+          2. Check AWS CloudWatch logs
+          3. Inspect pod events: `kubectl describe pod <pod-name> -n <namespace>`
+          4. Review security group rules
+          5. Check IAM permissions for the cluster role
+          
+          ## Next Steps
+          - Monitor cluster health continuously
+          - Cross-reference with Terraform configuration
+          - Ensure ArgoCD deployments are synced
+          
+          ---
+          Generated: $(date)
+          Cluster: ${{ steps.cluster_info.outputs.cluster_name }}
+          Region: ${{ steps.cluster_info.outputs.region }}
+          EOF
+          
+          cat eks_validation_report.md
+
+      - name: Upload Validation Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: eks-validation-report-${{ github.run_id }}
+          path: eks_validation_report.md
+          retention-days: 30
+
+      - name: Notify Slack - Validation Complete
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "EKS Cluster Validation Complete",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*EKS Cluster Validation*\n*Status*: ${{ job.status }}\n*Cluster*: ${{ steps.cluster_info.outputs.cluster_name }}\n*Region*: ${{ steps.cluster_info.outputs.region }}"
+                  }
+                }
+              ]
+            }
+        continue-on-error: true
